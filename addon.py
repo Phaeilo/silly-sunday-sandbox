@@ -79,16 +79,18 @@ class Policy:
         if self.header_callback is None:
             return
 
-        new_headers = []
-        for name, value in flow.request.headers.items():
+        new_fields = []
+        for name_b, value_b in flow.request.headers.fields:
+            name = name_b.decode("utf-8", "surrogateescape")
+            value = value_b.decode("utf-8", "surrogateescape")
             result = self.header_callback(name.lower(), value)
             if result is None:
                 logging.debug(f"dropped header {name!r} on request to {flow.request.host!r}")
             else:
                 if result != value:
                     logging.debug(f"substituted header {name!r} on request to {flow.request.host!r}")
-                new_headers.append((name, result))
-        flow.request.headers = http.Headers(new_headers)
+                new_fields.append((name_b, result.encode("utf-8", "surrogateescape")))
+        flow.request.headers.fields = tuple(new_fields)
 
     def filter_headers(self, flow: http.HTTPFlow):
         allowlist = self.header_allowlist
