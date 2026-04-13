@@ -46,11 +46,12 @@ class Policy:
     path_re: re.Pattern | None = None               # None = any path
     allow_query: bool = False                       # query strings forbidden by default
     header_allowlist: frozenset[str] | None = None  # None = apply ALWAYS_STRIP only
-    # Fake-to-real key substitution for x-api-key. When set, requests whose
-    # x-api-key value is not in the map are blocked; unknown keys are never
-    # forwarded. Use field() to exclude the dict from __hash__ (frozen=True
-    # generates __hash__ but dict is unhashable).
-    key_map: dict[str, str] | None = field(default=None, hash=False, compare=False)
+    # Fake-to-real key substitution for x-api-key and Authorization: Bearer.
+    # When set, requests whose presented key/token is not in the map are blocked.
+    # A None value means the key is recognised and forwarded as-is (no substitution).
+    # Use field() to exclude the dict from __hash__ (frozen=True generates __hash__
+    # but dict is unhashable).
+    key_map: dict[str, str | None] | None = field(default=None, hash=False, compare=False)
 
 
 POLICIES: list[Policy] = [
@@ -200,22 +201,26 @@ POLICIES: list[Policy] = [
     ),
 
     # --- Anthropic ---
-    # Full API access over HTTPS only. x-api-key is kept in the allowlist so it
-    # reaches the server (after optional substitution — see key_map below).
-    # Populate key_map to have the proxy swap fake aliases for the real key:
-    #   key_map={"dev-alias": "sk-ant-api03-..."}
-    # Requests carrying an unrecognised key are blocked rather than forwarded.
+    # Full API access over HTTPS only. Auth headers are kept in the allowlist so
+    # they reach the server (after substitution — see key_map below).
+    # Populate key_map to swap fake aliases for real credentials:
+    #   x-api-key:            key_map={"dev-alias": "sk-ant-api03-..."}
+    #   Authorization: Bearer key_map={"dev-token": "<real bearer token>"}
+    # Requests carrying an unrecognised key/token are blocked rather than forwarded.
+    # A None value in key_map forwards the presented credential unchanged.
     Policy(
         host="api.anthropic.com",
         schemes=frozenset({"https"}),
         allow_query=True,
         header_allowlist=BASE_HEADERS | frozenset({
             "x-api-key",
+            "authorization",
             "anthropic-version",
             "anthropic-beta",
         }),
         key_map={
-            "YOUR_API_KEY_HERE": os.getenv("ACTUAL_ANTHROPIC_API_KEY", "?"),
+            "YOUR_API_KEY_HERE": os.getenv("ACTUAL_ANTHROPIC_API_KEY"),
+            "YOUR_AUTH_TOKEN_HERE": os.getenv("ACTUAL_ANTHROPIC_AUTH_TOKEN"),
         },
     ),
     Policy(
@@ -246,21 +251,36 @@ def _find_matching_policy(flow: http.HTTPFlow) -> Policy | None:
 
 
 def _substitute_api_key(flow: http.HTTPFlow, policy: Policy) -> tuple[bool, str]:
-    """Replace the x-api-key header value using the policy's key_map.
+    """Replace x-api-key and Authorization: Bearer values using the policy's key_map.
 
-    Returns (False, reason) if the presented key is not in the map — it is
-    never forwarded in that case.  Skipped entirely when key_map is None.
+    Returns (False, reason) if the presented key/token is not in the map — it is
+    never forwarded in that case.  A None map value means the key is recognised
+    and forwarded as-is.  Skipped entirely when key_map is None.
     """
     if policy.key_map is None:
         return True, "ok"
+
     key = flow.request.headers.get("x-api-key")
-    if key is None:
-        return True, "ok"
-    real_key = policy.key_map.get(key)
-    if real_key is None:
-        return False, f"unrecognised x-api-key for '{flow.request.pretty_host}'"
-    flow.request.headers["x-api-key"] = real_key
-    logging.debug("Substituted x-api-key on request to %s", flow.request.pretty_host)
+    if key is not None:
+        if key not in policy.key_map:
+            return False, f"unrecognised x-api-key for '{flow.request.pretty_host}'"
+        real_key = policy.key_map[key]
+        if real_key is not None:
+            flow.request.headers["x-api-key"] = real_key
+            logging.debug("Substituted x-api-key on request to %s", flow.request.pretty_host)
+
+    auth_hdr = flow.request.headers.get("authorization")
+    if auth_hdr is not None:
+        _BEARER = "Bearer "
+        if auth_hdr.startswith(_BEARER):
+            token = auth_hdr[len(_BEARER):]
+            if token not in policy.key_map:
+                return False, f"unrecognised Bearer token for '{flow.request.pretty_host}'"
+            real_token = policy.key_map[token]
+            if real_token is not None:
+                flow.request.headers["authorization"] = _BEARER + real_token
+                logging.debug("Substituted Authorization Bearer token on request to %s", flow.request.pretty_host)
+
     return True, "ok"
 
 
