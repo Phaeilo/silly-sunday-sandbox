@@ -21,6 +21,7 @@ ALWAYS_STRIP = (
     "x-secret",
     "x-forwarded-for",
 )
+ALWAYS_STRIP_SET = frozenset(ALWAYS_STRIP)
 
 # Minimal set of headers kept when a policy uses a strict allowlist.
 BASE_HEADERS = (
@@ -66,7 +67,7 @@ class Policy:
             return False
         if self.methods is not None and flow.request.method not in self.methods:
             return False
-        if not self.allow_query and flow.request.query:
+        if not self.allow_query and "?" in flow.request.path:
             return False
         if self.path_re is not None and not self.path_re.match(flow.request.path):
             return False
@@ -94,12 +95,14 @@ class Policy:
 
     def filter_headers(self, flow: http.HTTPFlow):
         allowlist = self.header_allowlist
-        to_delete = [
-            name for name in dict.fromkeys(flow.request.headers)
-            if (allowlist is not None and name.lower() not in allowlist)
-            or (allowlist is None and name.lower() in ALWAYS_STRIP)
-        ] # NOTE: does this logic make sense?
-        for name in to_delete:
+        for name in dict.fromkeys(flow.request.headers):
+            lower = name.lower()
+
+            if allowlist is not None and lower in allowlist:
+                continue
+            if allowlist is None and lower not in ALWAYS_STRIP_SET:
+                continue
+
             del flow.request.headers[name]
             logging.debug(f"stripped header {name!r} on request to {flow.request.host!r}")
 
@@ -131,12 +134,13 @@ def _anthropic_header_callback(name: str, value: str) -> str | None:
             return os.getenv("ACTUAL_ANTHROPIC_API_KEY") or value
         return None  # drop
 
-    if name == "authorization" and value.startswith("Bearer "):
-        token = value.partition(" ")[-1]
-        if token == "PLACEHOLDER_AUTH_TOKEN":
-            real = os.getenv("ACTUAL_ANTHROPIC_AUTH_TOKEN")
-            return f"Bearer {real}" if real else value
-        return None  # drop
+    if name == "authorization":
+        if value.startswith("Bearer "):
+            token = value.partition(" ")[-1]
+            if token == "PLACEHOLDER_AUTH_TOKEN":
+                real = os.getenv("ACTUAL_ANTHROPIC_AUTH_TOKEN")
+                return f"Bearer {real}" if real else value
+        return None  # drop ALL authorization values that aren't the expected Bearer placeholder
 
     return value
 
