@@ -1,14 +1,17 @@
+import functools
 import logging
-import re
-from dataclasses import dataclass, field
 import os
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Self
 
 from mitmproxy import http
 from mitmproxy.net.http.url import default_port, parse_authority
 
 # Headers stripped from every request regardless of policy.
 # Covers the most common vectors for leaking credentials or session state.
-ALWAYS_STRIP: frozenset[str] = frozenset({
+ALWAYS_STRIP = (
     "authorization",
     "cookie",
     "proxy-authorization",
@@ -16,11 +19,11 @@ ALWAYS_STRIP: frozenset[str] = frozenset({
     "x-api-key",
     "x-access-token",
     "x-secret",
-    "x-forwarded-for",  # avoid leaking internal topology
-})
+    "x-forwarded-for",
+)
 
 # Minimal set of headers kept when a policy uses a strict allowlist.
-BASE_HEADERS: frozenset[str] = frozenset({
+BASE_HEADERS = (
     "host",
     "user-agent",
     "accept",
@@ -35,366 +38,245 @@ BASE_HEADERS: frozenset[str] = frozenset({
     "if-none-match",
     "range",
     "transfer-encoding",
-})
+)
+
+
+class BlockRequest(Exception):
+    """Raised inside mitmproxy hooks to block the current flow with a 403."""
 
 
 @dataclass(frozen=True)
 class Policy:
+    """Describes what requests are permitted for a given host."""
     host: str
-    methods: frozenset[str] | None = None           # None = any method
-    schemes: frozenset[str] | None = None           # None = http and https
-    path_re: re.Pattern | None = None               # None = any path
-    allow_query: bool = False                       # query strings forbidden by default
-    header_allowlist: frozenset[str] | None = None  # None = apply ALWAYS_STRIP only
-    # Fake-to-real key substitution for x-api-key and Authorization: Bearer.
-    # When set, requests whose presented key/token is not in the map are blocked.
-    # A None value means the key is recognised and forwarded as-is (no substitution).
-    # Use field() to exclude the dict from __hash__ (frozen=True generates __hash__
-    # but dict is unhashable).
-    key_map: dict[str, str | None] | None = field(default=None, hash=False, compare=False)
+    methods: tuple[str, ...] | None = None
+    http: bool = True
+    https: bool = True
+    path_re: re.Pattern | None = None
+    allow_query: bool = False
+    header_allowlist: tuple[str, ...] | None = None
+    header_callback: Callable[[str, str], str | None] | None = field(default=None, hash=False, compare=False)
+
+    def allows_request(self, flow: http.HTTPFlow) -> bool:
+        if self.host != flow.request.host:
+            return False
+        if flow.request.scheme == "http" and not self.http:
+            return False
+        if flow.request.scheme == "https" and not self.https:
+            return False
+        if self.methods is not None and flow.request.method not in self.methods:
+            return False
+        if not self.allow_query and flow.request.query:
+            return False
+        if self.path_re is not None and not self.path_re.match(flow.request.path):
+            return False
+        return True
+
+    def allows_connect(self, host: str, port: int) -> bool:
+        return (self.host == host) and ((port == 443 and self.https) or (port == 80 and self.http))
+
+    def apply_header_callback(self, flow: http.HTTPFlow):
+        if self.header_callback is None:
+            return
+
+        new_headers = []
+        for name, value in flow.request.headers.items():
+            result = self.header_callback(name.lower(), value)
+            if result is None:
+                logging.debug(f"dropped header {name!r} on request to {flow.request.host!r}")
+            else:
+                if result != value:
+                    logging.debug(f"substituted header {name!r} on request to {flow.request.host!r}")
+                new_headers.append((name, result))
+        flow.request.headers = http.Headers(new_headers)
+
+    def filter_headers(self, flow: http.HTTPFlow):
+        allowlist = self.header_allowlist
+        to_delete = [
+            name for name in dict.fromkeys(flow.request.headers)
+            if (allowlist is not None and name.lower() not in allowlist)
+            or (allowlist is None and name.lower() in ALWAYS_STRIP)
+        ] # NOTE: does this logic make sense?
+        for name in to_delete:
+            del flow.request.headers[name]
+            logging.debug(f"stripped header {name!r} on request to {flow.request.host!r}")
+
+    @classmethod
+    def readonly(
+        cls,
+        host: str,
+        *,
+        allow_query: bool = False,
+        https_only: bool = False,
+        extra_headers: tuple[str, ...] = (),
+    ) -> Self:
+        return cls(
+            host=host,
+            methods=("GET", "HEAD"),
+            http=not https_only,
+            allow_query=allow_query,
+            header_allowlist=BASE_HEADERS + extra_headers,
+        )
 
 
-POLICIES: list[Policy] = [
-    Policy(
-        host="archive.ubuntu.com",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        header_allowlist=BASE_HEADERS,
-    ),
-    Policy(
-        host="security.ubuntu.com",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        header_allowlist=BASE_HEADERS,
-    ),
-    Policy(
-        host="deb.nodesource.com",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        header_allowlist=BASE_HEADERS,
-    ),
-    Policy(
-        host="static.rust-lang.org",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        header_allowlist=BASE_HEADERS,
-    ),
-    # Git clone via Smart HTTP (GET for ref discovery, POST for pack negotiation)
+def _anthropic_header_callback(name: str, value: str) -> str | None:
+    """
+    Substitute placeholder API credentials with real ones from the environment.
+    Only inspects x-api-key and Authorization: Bearer; passes all other headers through.
+    """
+    if name == "x-api-key":
+        if value == "PLACEHOLDER_API_KEY":
+            return os.getenv("ACTUAL_ANTHROPIC_API_KEY") or value
+        return None  # drop
+
+    if name == "authorization" and value.startswith("Bearer "):
+        token = value.partition(" ")[-1]
+        if token == "PLACEHOLDER_AUTH_TOKEN":
+            real = os.getenv("ACTUAL_ANTHROPIC_AUTH_TOKEN")
+            return f"Bearer {real}" if real else value
+        return None  # drop
+
+    return value
+
+
+# NOTE: maybe load this form file
+POLICIES = [
+    # Ubuntu package repos
+    Policy.readonly("archive.ubuntu.com"),
+    Policy.readonly("security.ubuntu.com"),
+    Policy.readonly("deb.nodesource.com"),
+
+    # Software libraries
+    Policy.readonly("pypi.org", allow_query=True),
+    Policy.readonly("files.pythonhosted.org"),
+    Policy.readonly("registry.npmjs.org", allow_query=True),
+    Policy.readonly("static.rust-lang.org"),
+    Policy.readonly("crates.io", allow_query=True),
+    Policy.readonly("static.crates.io"),
+    Policy.readonly("proxy.golang.org"),
+    Policy.readonly("sum.golang.org"),
+
+    # Documentation
+    Policy.readonly("stackoverflow.com", allow_query=True),
+    Policy.readonly("developer.mozilla.org", allow_query=True),
+
+    # GitHub
+    # clone via smart HTTP
     Policy(
         host="github.com",
-        methods=frozenset({"GET", "POST"}),
-        schemes=frozenset({"http", "https"}),
+        methods=("GET", "POST"),
         path_re=re.compile(r"^/[^/]+/[^/]+\.git/(info/refs(\?.*)?|git-upload-pack)$"),
-        allow_query=True,  # info/refs uses ?service=git-upload-pack
-        header_allowlist=BASE_HEADERS | frozenset({"git-protocol"}),
-    ),
-    # Read-only website browsing
-    Policy(
-        host="github.com",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
         allow_query=True,
-        header_allowlist=BASE_HEADERS,
+        header_allowlist=BASE_HEADERS + ("git-protocol",),
     ),
-    Policy(
-        host="raw.githubusercontent.com",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        header_allowlist=BASE_HEADERS,
-    ),
-    Policy(
-        host="release-assets.githubusercontent.com",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        header_allowlist=BASE_HEADERS,
-    ),
-    # Full access, but auth/session headers are still stripped
-    # Policy(
-    #     host="httpbin.org",
-    #     allow_query=True,
-    # ),
+    # source code downloads
+    Policy.readonly("raw.githubusercontent.com"),
+    Policy.readonly("release-assets.githubusercontent.com"),
+    Policy.readonly("codeload.github.com", https_only=True),
+    # website browsing
+    Policy.readonly("github.com", allow_query=True),
+    # read-only API access, auth headers stripped
+    Policy.readonly("api.github.com", allow_query=True, https_only=True),
 
-    # --- Python ---
-    Policy(
-        host="pypi.org",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        allow_query=True,  # simple index and JSON API use query params
-        header_allowlist=BASE_HEADERS,
-    ),
-    Policy(
-        host="files.pythonhosted.org",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        header_allowlist=BASE_HEADERS,
-    ),
-
-    # --- Node / npm ---
-    Policy(
-        host="registry.npmjs.org",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        allow_query=True,  # search endpoint uses ?text=
-        header_allowlist=BASE_HEADERS,
-    ),
-
-    # --- Rust / Cargo ---
-    Policy(
-        host="crates.io",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        allow_query=True,  # crate search API
-        header_allowlist=BASE_HEADERS,
-    ),
-    Policy(
-        host="static.crates.io",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        header_allowlist=BASE_HEADERS,
-    ),
-
-    # --- Go modules ---
-    Policy(
-        host="proxy.golang.org",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        header_allowlist=BASE_HEADERS,
-    ),
-    Policy(
-        host="sum.golang.org",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        header_allowlist=BASE_HEADERS,
-    ),
-
-    # --- GitHub extras ---
-    # Read-only REST API access (no writes, no token uploads since auth headers are stripped)
-    Policy(
-        host="api.github.com",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"https"}),
-        allow_query=True,
-        header_allowlist=BASE_HEADERS,
-    ),
-    # Source archive downloads (zip/tar.gz of repos)
-    Policy(
-        host="codeload.github.com",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"https"}),
-        header_allowlist=BASE_HEADERS,
-    ),
-
-    # --- Reference / docs ---
-    Policy(
-        host="stackoverflow.com",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        allow_query=True,  # search and pagination
-        header_allowlist=BASE_HEADERS,
-    ),
-    Policy(
-        host="developer.mozilla.org",
-        methods=frozenset({"GET", "HEAD"}),
-        schemes=frozenset({"http", "https"}),
-        allow_query=True,
-        header_allowlist=BASE_HEADERS,
-    ),
-
-    # --- Anthropic ---
-    # Full API access over HTTPS only. Auth headers are kept in the allowlist so
-    # they reach the server (after substitution — see key_map below).
-    # Populate key_map to swap fake aliases for real credentials:
-    #   x-api-key:            key_map={"dev-alias": "sk-ant-api03-..."}
-    #   Authorization: Bearer key_map={"dev-token": "<real bearer token>"}
-    # Requests carrying an unrecognised key/token are blocked rather than forwarded.
-    # A None value in key_map forwards the presented credential unchanged.
+    # Anthropic
+    # Full API access
     Policy(
         host="api.anthropic.com",
-        schemes=frozenset({"https"}),
+        http=False,
         allow_query=True,
-        header_allowlist=BASE_HEADERS | frozenset({
+        header_allowlist=BASE_HEADERS + (
             "x-api-key",
             "authorization",
             "anthropic-version",
             "anthropic-beta",
-        }),
-        key_map={
-            "YOUR_API_KEY_HERE": os.getenv("ACTUAL_ANTHROPIC_API_KEY"),
-            "YOUR_AUTH_TOKEN_HERE": os.getenv("ACTUAL_ANTHROPIC_AUTH_TOKEN"),
-        },
+        ),
+        header_callback=_anthropic_header_callback,
     ),
-    Policy(
-        host="platform.claude.com",
-        schemes=frozenset({"https"}),
-        methods=frozenset({"GET", "HEAD"}),
-        allow_query=True,
-        header_allowlist=BASE_HEADERS,
-    ),
+    # contacted during Claude startup
+    Policy.readonly("platform.claude.com", allow_query=True, https_only=True),
 ]
 
 
-def _find_matching_policy(flow: http.HTTPFlow) -> Policy | None:
-    """Return the first policy that matches the request, or None."""
-    for policy in POLICIES:
-        if policy.host != flow.request.pretty_host:
-            continue
-        if policy.schemes is not None and flow.request.scheme not in policy.schemes:
-            continue
-        if policy.methods is not None and flow.request.method not in policy.methods:
-            continue
-        if not policy.allow_query and flow.request.query:
-            continue
-        if policy.path_re is not None and not policy.path_re.match(flow.request.path):
-            continue
-        return policy
-    return None
-
-
-def _substitute_api_key(flow: http.HTTPFlow, policy: Policy) -> tuple[bool, str]:
-    """Replace x-api-key and Authorization: Bearer values using the policy's key_map.
-
-    Returns (False, reason) if the presented key/token is not in the map — it is
-    never forwarded in that case.  A None map value means the key is recognised
-    and forwarded as-is.  Skipped entirely when key_map is None.
-    """
-    if policy.key_map is None:
-        return True, "ok"
-
-    key = flow.request.headers.get("x-api-key")
-    if key is not None:
-        if key not in policy.key_map:
-            return False, f"unrecognised x-api-key for '{flow.request.pretty_host}'"
-        real_key = policy.key_map[key]
-        if real_key is not None:
-            flow.request.headers["x-api-key"] = real_key
-            logging.debug("Substituted x-api-key on request to %s", flow.request.pretty_host)
-
-    auth_hdr = flow.request.headers.get("authorization")
-    if auth_hdr is not None:
-        _BEARER = "Bearer "
-        if auth_hdr.startswith(_BEARER):
-            token = auth_hdr[len(_BEARER):]
-            if token not in policy.key_map:
-                return False, f"unrecognised Bearer token for '{flow.request.pretty_host}'"
-            real_token = policy.key_map[token]
-            if real_token is not None:
-                flow.request.headers["authorization"] = _BEARER + real_token
-                logging.debug("Substituted Authorization Bearer token on request to %s", flow.request.pretty_host)
-
-    return True, "ok"
-
-
-def _filter_headers(flow: http.HTTPFlow, policy: Policy) -> None:
-    """Strip sensitive or out-of-policy headers from the request in-place."""
-    allowlist = policy.header_allowlist
-    to_remove = [
-        name for name in flow.request.headers
-        if (allowlist is not None and name.lower() not in allowlist)
-        or (allowlist is None and name.lower() in ALWAYS_STRIP)
-    ]
-    for name in to_remove:
-        del flow.request.headers[name]
-        logging.debug("Stripped header '%s' on request to %s", name, flow.request.pretty_host)
-
-
 class TrafficFilter:
-    def __init__(self):
+    """mitmproxy addon that enforces per-host traffic policies."""
+
+    def __init__(self, policies=POLICIES):
+        self.policies = policies
         self.num_seen = 0
         self.num_blocked = 0
 
-    def _block(self, flow: http.HTTPFlow, reason: str) -> None:
-        self.num_blocked += 1
-        logging.warning(
-            "BLOCKED [%d/%d] %s %s://%s%s — %s",
-            self.num_blocked,
-            self.num_seen,
-            flow.request.method,
-            flow.request.scheme,
-            flow.request.pretty_host,
-            flow.request.path,
-            reason,
-        )
-        flow.response = http.Response.make(
-            403,
-            f"Blocked by traffic policy: {reason}",
-            {"Content-Type": "text/plain"},
-        )
+    @staticmethod
+    def _flow_url(flow: http.HTTPFlow) -> str:
+        return f"{flow.request.method} {flow.request.scheme}://{flow.request.host}{flow.request.path}"
 
-    def http_connect(self, flow: http.HTTPFlow) -> None:
-        # Use flow.request.host (the actual CONNECT target), not pretty_host,
-        # which would look at the Host header and allow spoofing the allowlist.
-        host = flow.request.host
+    @staticmethod
+    def _handle_block(method):
+        @functools.wraps(method)
+        def wrapper(self, flow: http.HTTPFlow):
+            try:
+                method(self, flow)
+            except BlockRequest as e:
+                self.num_blocked += 1
+                logging.warning(f"BLOCKED [{self.num_blocked}/{self.num_seen}] {self._flow_url(flow)} — {e}")
+                flow.response = http.Response.make(
+                    403,
+                    f"Blocked by traffic policy: {e}",
+                    {"Content-Type": "text/plain"},
+                )
+        return wrapper
+
+    @_handle_block
+    def http_connect(self, flow: http.HTTPFlow):
+        self.num_seen += 1
+
+        # CONNECT target from the request line
+        connect_to = flow.request.host
+
+        # If a Host header is present, it must match the CONNECT target exactly
         host_hdr = flow.request.headers.get("host")
         if host_hdr is not None:
             try:
-                parsed_host, _ = parse_authority(host_hdr, check=True)
+                parsed_host, port = parse_authority(host_hdr, check=True)
             except ValueError:
-                parsed_host = None
-            if parsed_host != host:
-                logging.warning(
-                    "BLOCKED CONNECT to '%s' — Host header '%s' does not match CONNECT target",
-                    host, host_hdr,
-                )
-                flow.response = http.Response.make(
-                    403,
-                    f"Blocked by traffic policy: Host header '{host_hdr}' does not match CONNECT target '{host}'",
-                    {"Content-Type": "text/plain"},
-                )
-                return
-        if not any(p.host == host for p in POLICIES):
-            logging.warning("BLOCKED CONNECT to '%s' — host not in policy", host)
-            flow.response = http.Response.make(
-                403,
-                f"Blocked by traffic policy: host '{host}' not in policy",
-                {"Content-Type": "text/plain"},
-            )
+                parsed_host, port = None, None
 
-    def requestheaders(self, flow: http.HTTPFlow) -> None:
-        self.num_seen += 1
+            if parsed_host != connect_to:
+                raise BlockRequest(f"Host header {host_hdr!r} does not match CONNECT target {connect_to!r}")
+            if port is not None and port != flow.request.port:
+                raise BlockRequest(f"Host header port {port} does not match CONNECT target port {flow.request.port}")
 
-        host_hdr = flow.request.headers.get("host", "")
+        if not any(p.allows_connect(connect_to, flow.request.port) for p in self.policies):
+            raise BlockRequest(f"no policy allows CONNECT to {connect_to!r}:{flow.request.port}")
+
+    @_handle_block
+    def requestheaders(self, flow: http.HTTPFlow):
+        # Ensure Host header is well-formed
+        host_hdr = flow.request.headers.get("host")
         if not host_hdr:
-            self._block(flow, "missing or empty Host header")
-            return
+            raise BlockRequest("missing or empty Host header")
+
         try:
             parsed_host, port = parse_authority(host_hdr, check=True)
         except ValueError:
-            self._block(flow, f"malformed Host header: {host_hdr!r}")
-            return
+            raise BlockRequest(f"malformed Host header: {host_hdr!r}")
+
+        # Host header must match the TCP/TLS connection target
         if parsed_host != flow.request.host:
-            self._block(flow, f"Host header '{parsed_host}' does not match connection target '{flow.request.host}'")
-            return
+            raise BlockRequest(f"Host header {parsed_host!r} does not match connection target {flow.request.host!r}")
+
+        # Reject non-standard ports
         if port is not None and port != default_port(flow.request.scheme):
-            self._block(flow, f"Host header port {port} not allowed for scheme '{flow.request.scheme}'")
-            return
+            raise BlockRequest(f"Host header port {port} not allowed for scheme {flow.request.scheme!r}")
 
-        policy = _find_matching_policy(flow)
+        # Find the first policy whose constraints match
+        policy = next((p for p in self.policies if p.allows_request(flow)), None)
         if policy is None:
-            host = flow.request.pretty_host
-            known = any(p.host == host for p in POLICIES)
-            reason = (
-                f"no matching policy for {flow.request.method} "
-                f"{flow.request.scheme}://{host}{flow.request.path}"
-                if known else
-                f"host '{host}' not in policy"
-            )
-            self._block(flow, reason)
-            return
+            raise BlockRequest(f"no matching policy for {self._flow_url(flow)}")
 
-        allowed, reason = _substitute_api_key(flow, policy)
-        if not allowed:
-            self._block(flow, reason)
-            return
-
-        _filter_headers(flow, policy)
-        logging.info(
-            "ALLOWED [%d seen] %s %s://%s%s",
-            self.num_seen,
-            flow.request.method,
-            flow.request.scheme,
-            flow.request.pretty_host,
-            flow.request.path,
-        )
+        # Modify headers: substitute/drop via callback, then strip by allowlist
+        policy.apply_header_callback(flow)
+        policy.filter_headers(flow)
+        logging.info(f"ALLOWED [{self.num_seen} seen] {self._flow_url(flow)}")
 
 
 addons = [TrafficFilter()]

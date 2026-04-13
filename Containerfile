@@ -139,7 +139,7 @@ RUN mkdir -p ~/work \
         echo '. /etc/profile.d/proxy.sh'; \
         echo 'alias danger-claude="claude --dangerously-skip-permissions"'; \
         echo 'export PATH=/home/ubuntu/.cargo/bin:/home/ubuntu/.local/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'; \
-        echo 'export ANTHROPIC_API_KEY=YOUR_API_KEY_HERE'; \
+        echo 'export ANTHROPIC_API_KEY=PLACEHOLDER_API_KEY'; \
         echo 'export ANTHROPIC_BASE_URL=https://api.anthropic.com'; \
         echo 'export CLAUDE_CODE_DISABLE_TELEMETRY=1'; \
         echo 'export UV_NATIVE_TLS=1'; \
