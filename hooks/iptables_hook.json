@@ -1,0 +1,12 @@
+{
+    "version": "1.0.0",
+    "hook": {
+        "path": "/home/philip/Documents/Projects/sandbox/firewall.sh"
+    },
+    "when": {
+        "annotations": {
+            "^myannotation$": "yes"
+        }
+    },
+    "stages": ["createContainer"]
+}
