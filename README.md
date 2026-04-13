@@ -16,8 +16,7 @@ export ACTUAL_ANTHROPIC_API_KEY=sk-ant-...
 ./run-mitmproxy.sh
 # (new terminal)
 ./run-container.sh
-
-# Inside container
+# (inside container)
 cd work/
 danger-claude
 # Go wild!
@@ -37,13 +36,13 @@ Also requires: `openssl` and `jq`
 
 A lot of this is deliberately specific rather than generic; adjust to taste:
 
-- **Proxy port** — `31337` (in `mitmcfg/config.yaml`, `firewall.sh`, `Containerfile`)
-- **Network range** — `10.0.2.0/24`, gateway `10.0.2.2` (pasta config in `run-container.sh`)
-- **Allowed hosts and policies** — `POLICIES` list in `addon.py`
-- **API key placeholders** — `PLACEHOLDER_API_KEY` / `PLACEHOLDER_AUTH_TOKEN` and the env var names they map to
-- **Container mounts** — `./shared` and the kitty terminfo path in `run-container.sh`
-- **Installed tooling** — compilers, RE tools, language runtimes in `Containerfile`
-- **System prompt** — `sandbox_system_prompt.md` baked into the image
+- **Proxy port** `31337` (in `mitmcfg/config.yaml`, `firewall.sh`, `Containerfile`)
+- **Network range** `10.0.2.0/24`, gateway `10.0.2.2` (pasta config in `run-container.sh`)
+- **Allowed hosts and policies** `POLICIES` list in `addon.py`
+- **API key placeholders** `PLACEHOLDER_API_KEY` / `PLACEHOLDER_AUTH_TOKEN` and the env var names they map to
+- **Container mounts** `./shared` and the kitty terminfo path in `run-container.sh`
+- **Installed tooling** compilers, RE tools, language runtimes in `Containerfile`
+- **System prompt** `sandbox_system_prompt.md` baked into the image
 
 ## License
 
