@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import os
 
 from mitmproxy import http
+from mitmproxy.net.http.url import default_port, parse_authority
 
 # Headers stripped from every request regardless of policy.
 # Covers the most common vectors for leaking credentials or session state.
@@ -300,7 +301,26 @@ class TrafficFilter:
         )
 
     def http_connect(self, flow: http.HTTPFlow) -> None:
-        host = flow.request.pretty_host
+        # Use flow.request.host (the actual CONNECT target), not pretty_host,
+        # which would look at the Host header and allow spoofing the allowlist.
+        host = flow.request.host
+        host_hdr = flow.request.headers.get("host")
+        if host_hdr is not None:
+            try:
+                parsed_host, _ = parse_authority(host_hdr, check=True)
+            except ValueError:
+                parsed_host = None
+            if parsed_host != host:
+                logging.warning(
+                    "BLOCKED CONNECT to '%s' — Host header '%s' does not match CONNECT target",
+                    host, host_hdr,
+                )
+                flow.response = http.Response.make(
+                    403,
+                    f"Blocked by traffic policy: Host header '{host_hdr}' does not match CONNECT target '{host}'",
+                    {"Content-Type": "text/plain"},
+                )
+                return
         if not any(p.host == host for p in POLICIES):
             logging.warning("BLOCKED CONNECT to '%s' — host not in policy", host)
             flow.response = http.Response.make(
@@ -311,6 +331,22 @@ class TrafficFilter:
 
     def requestheaders(self, flow: http.HTTPFlow) -> None:
         self.num_seen += 1
+
+        host_hdr = flow.request.headers.get("host", "")
+        if not host_hdr:
+            self._block(flow, "missing or empty Host header")
+            return
+        try:
+            parsed_host, port = parse_authority(host_hdr, check=True)
+        except ValueError:
+            self._block(flow, f"malformed Host header: {host_hdr!r}")
+            return
+        if parsed_host != flow.request.host:
+            self._block(flow, f"Host header '{parsed_host}' does not match connection target '{flow.request.host}'")
+            return
+        if port is not None and port != default_port(flow.request.scheme):
+            self._block(flow, f"Host header port {port} not allowed for scheme '{flow.request.scheme}'")
+            return
 
         policy = _find_matching_policy(flow)
         if policy is None:
