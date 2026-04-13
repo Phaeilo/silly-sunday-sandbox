@@ -1,5 +1,4 @@
 http2: false
-http2_ping_keepalive: 58
 http3: false
 websocket: false
 rawtcp: false
@@ -7,15 +6,10 @@ rawtcp: false
 listen_host: '127.0.0.1'
 listen_port: 31337
 
-# block_private: false
-# block_global: true
-
 mode:
 - regular
 
 onboarding: false
-
-scripts: ["/home/philip/Documents/Projects/sandbox/addon.py"]
 
 server: true
 connection_strategy: "lazy"
