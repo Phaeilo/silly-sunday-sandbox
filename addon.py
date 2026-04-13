@@ -299,12 +299,18 @@ class TrafficFilter:
             {"Content-Type": "text/plain"},
         )
 
-    def request(self, flow: http.HTTPFlow) -> None:
-        self.num_seen += 1
+    def http_connect(self, flow: http.HTTPFlow) -> None:
+        host = flow.request.pretty_host
+        if not any(p.host == host for p in POLICIES):
+            logging.warning("BLOCKED CONNECT to '%s' — host not in policy", host)
+            flow.response = http.Response.make(
+                403,
+                f"Blocked by traffic policy: host '{host}' not in policy",
+                {"Content-Type": "text/plain"},
+            )
 
-        if flow.request.method in {"GET", "HEAD"} and flow.request.content:
-            self._block(flow, f"{flow.request.method} request must not carry a body")
-            return
+    def requestheaders(self, flow: http.HTTPFlow) -> None:
+        self.num_seen += 1
 
         policy = _find_matching_policy(flow)
         if policy is None:
