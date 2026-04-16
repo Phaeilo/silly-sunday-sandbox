@@ -131,14 +131,14 @@ def _anthropic_header_callback(name: str, value: str) -> str | None:
     """
     if name == "x-api-key":
         if value == "PLACEHOLDER_API_KEY":
-            return os.getenv("ACTUAL_ANTHROPIC_API_KEY") or value
+            return os.getenv("ANTHROPIC_API_KEY") or value
         return None  # drop
 
     if name == "authorization":
         if value.startswith("Bearer "):
             token = value.partition(" ")[-1]
             if token == "PLACEHOLDER_AUTH_TOKEN":
-                real = os.getenv("ACTUAL_ANTHROPIC_AUTH_TOKEN")
+                real = os.getenv("ANTHROPIC_AUTH_TOKEN")
                 return f"Bearer {real}" if real else value
         return None  # drop ALL authorization values that aren't the expected Bearer placeholder
 
@@ -187,7 +187,7 @@ POLICIES = [
     # Anthropic
     # Full API access
     Policy(
-        host="api.anthropic.com",
+        host=os.getenv("ANTHROPIC_BASE_URL", "api.anthropic.com"), 
         http=False,
         allow_query=True,
         header_allowlist=BASE_HEADERS + (
